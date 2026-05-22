@@ -21,26 +21,40 @@ pub struct WindowSettings {
 
 impl WindowSettings {
     pub fn from_window(egui_zoom_factor: f32, window: &winit::window::Window) -> Self {
-        let inner_size_points = window
+        let mut inner_size_points = window
             .inner_size()
             .to_logical::<f32>(egui_zoom_factor as f64 * window.scale_factor());
 
-        let inner_position_pixels = window
+        let mut inner_position_pixels = window
             .inner_position()
             .ok()
             .map(|p| egui::pos2(p.x as f32, p.y as f32));
 
-        let outer_position_pixels = window
+        let mut outer_position_pixels = window
             .outer_position()
             .ok()
             .map(|p| egui::pos2(p.x as f32, p.y as f32));
+
+        let maximized = window.is_maximized();
+
+        if maximized {
+            // Save the normal position so that the window gets restored to the previous position
+            // when unmaximized.
+            if let Some(normal_placement) = windows_normal_placement(window) {
+                inner_size_points = normal_placement
+                    .inner_size
+                    .to_logical::<f32>(egui_zoom_factor as f64 * window.scale_factor());
+                inner_position_pixels = None;
+                outer_position_pixels = Some(normal_placement.outer_position);
+            }
+        }
 
         Self {
             inner_position_pixels,
             outer_position_pixels,
 
             fullscreen: window.fullscreen().is_some(),
-            maximized: window.is_maximized(),
+            maximized,
 
             inner_size_points: Some(egui::vec2(
                 inner_size_points.width,
@@ -139,6 +153,63 @@ impl WindowSettings {
             clamp_pos_to_monitors(egui_zoom_factor, event_loop, inner_size_points, pos_px);
         }
     }
+}
+
+struct NormalPlacement {
+    outer_position: egui::Pos2,
+    inner_size: winit::dpi::PhysicalSize<u32>,
+}
+
+#[cfg(target_os = "windows")]
+#[expect(unsafe_code)]
+fn windows_normal_placement(window: &winit::window::Window) -> Option<NormalPlacement> {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT},
+    };
+
+    let RawWindowHandle::Win32(window_handle) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+
+    // SAFETY: `WINDOWPLACEMENT` is a plain Win32 struct, and zero is a valid
+    // initial value before setting the required `length` field.
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    let hwnd = window_handle.hwnd.get() as HWND;
+
+    // SAFETY: `hwnd` comes from winit's window handle, and `placement` is a
+    // valid writable `WINDOWPLACEMENT` with its `length` field initialized.
+    if unsafe { GetWindowPlacement(hwnd, &mut placement) } == 0 {
+        return None;
+    }
+
+    let outer_rect = placement.rcNormalPosition;
+    let outer_width = u32::try_from(outer_rect.right - outer_rect.left).ok()?;
+    let outer_height = u32::try_from(outer_rect.bottom - outer_rect.top).ok()?;
+
+    let current_outer_size = window.outer_size();
+    let current_inner_size = window.inner_size();
+    let frame_width = current_outer_size
+        .width
+        .saturating_sub(current_inner_size.width);
+    let frame_height = current_outer_size
+        .height
+        .saturating_sub(current_inner_size.height);
+
+    Some(NormalPlacement {
+        outer_position: egui::pos2(outer_rect.left as f32, outer_rect.top as f32),
+        inner_size: winit::dpi::PhysicalSize::new(
+            outer_width.saturating_sub(frame_width).max(1),
+            outer_height.saturating_sub(frame_height).max(1),
+        ),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_normal_placement(_window: &winit::window::Window) -> Option<NormalPlacement> {
+    None
 }
 
 fn find_active_monitor(
